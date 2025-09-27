@@ -21,35 +21,28 @@ jobs:
               gcc clang llvm lld git zip unzip wget curl build-essential \
               python3 python3-pip ccache
 
-      - name: Setup Toolchain (with Clang fallback)
+      - name: Setup Toolchain
         run: |
           mkdir -p ~/toolchains
           cd ~/toolchains
-          # GCC 4.9
+          # GCC 4.9 (for cross-compile)
           git clone https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 --depth=1 gcc64
 
-          # Try Clang 14
-          CLANG_URL_14="https://github.com/llvm/llvm-project/releases/download/llvmorg-14.0.6/clang+llvm-14.0.6-x86_64-linux-gnu-ubuntu-20.04.tar.xz"
-          CLANG_URL_13="https://github.com/llvm/llvm-project/releases/download/llvmorg-13.0.1/clang+llvm-13.0.1-x86_64-linux-gnu-ubuntu-20.04.tar.xz"
-
-          echo ">>> Downloading Clang 14..."
-          if wget -q --spider $CLANG_URL_14; then
-            wget $CLANG_URL_14 -O clang.tar.xz
+          # Install Clang (use clang-14 if available, else fallback to clang-15)
+          if sudo apt-get install -y clang-14 lld-14; then
+            ln -s /usr/bin/clang-14 ~/toolchains/clang
+            ln -s /usr/bin/ld.lld-14 ~/toolchains/ld.lld
           else
-            echo "⚠️ Clang 14 not found, falling back to Clang 13"
-            wget $CLANG_URL_13 -O clang.tar.xz
+            sudo apt-get install -y clang-15 lld-15
+            ln -s /usr/bin/clang-15 ~/toolchains/clang
+            ln -s /usr/bin/ld.lld-15 ~/toolchains/ld.lld
           fi
-
-          tar -xf clang.tar.xz
-          mv clang+llvm-* clang
 
       - name: Detect Kernel Version
         id: kver
         run: |
           cd $GITHUB_WORKSPACE
-          KERNEL_MAJOR=$(grep -m1 "^VERSION =" Makefile | awk '{print $3}')
-          KERNEL_MINOR=$(grep -m1 "^PATCHLEVEL =" Makefile | awk '{print $3}')
-          KERNEL_VER="${KERNEL_MAJOR}.${KERNEL_MINOR}"
+          KERNEL_VER=$(grep -m1 "SUBLEVEL" Makefile | awk '{print $3}')
           echo "kernel_ver=$KERNEL_VER" >> $GITHUB_OUTPUT
 
       - name: Add KernelSU
@@ -58,33 +51,24 @@ jobs:
           git clone https://github.com/tiann/KernelSU ksu
           cd ksu
           git submodule update --init --recursive
-
-          cd $GITHUB_WORKSPACE
-          KERNEL_VER="${{ steps.kver.outputs.kernel_ver }}"
-          echo ">>> Detected kernel version: $KERNEL_VER"
-
-          if [ -d "ksu/next/patches/$KERNEL_VER" ]; then
-            echo ">>> Applying KernelSU patches for $KERNEL_VER"
-            cd ksu
-            git am next/patches/$KERNEL_VER/* || { echo "❌ Patch failed"; exit 1; }
+          # Apply matching patch if available
+          if [ -d "next/patches/${{ steps.kver.outputs.kernel_ver }}" ]; then
+            git am next/patches/${{ steps.kver.outputs.kernel_ver }}/*
           else
-            echo "⚠️ No KernelSU patch found for $KERNEL_VER"
-            # Choose one behavior:
-            # exit 1   # Stop build if KernelSU not supported
-            echo ">>> Continuing without KernelSU" # Continue without KernelSU
+            echo "⚠️ No matching KernelSU patch found for kernel version ${{ steps.kver.outputs.kernel_ver }}"
           fi
 
       - name: Build Kernel
         run: |
           export ARCH=arm64
           export SUBARCH=arm64
-          export PATH=$HOME/toolchains/gcc64/bin:$HOME/toolchains/clang/bin:$PATH
+          export PATH=$HOME/toolchains/gcc64/bin:$HOME/toolchains:$PATH
           export CROSS_COMPILE=aarch64-linux-android-
           export CC=clang
 
           cd $GITHUB_WORKSPACE
 
-          # Generate default config (change to your defconfig!)
+          # Generate defconfig (update for your device if needed)
           make raphael_defconfig
 
           # Enable modules + disable signature enforcement
