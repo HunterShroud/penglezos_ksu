@@ -1,4 +1,5 @@
-name: Build Kernel with KernelSU
+```yaml
+name: Build Kernel with KernelSU + AnyKernel3
 
 on:
   push:
@@ -17,7 +18,8 @@ jobs:
       - name: Setup Build Environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y git wget curl build-essential bc bison flex libncurses5-dev libssl-dev ccache unzip zip
+          sudo apt-get install -y git wget curl build-essential bc bison flex \
+              libncurses5-dev libssl-dev ccache unzip zip python3
 
       - name: Setup Toolchains (Clang + GCC)
         run: |
@@ -43,8 +45,11 @@ jobs:
         id: kernelver
         run: |
           cd $GITHUB_WORKSPACE
-          KERNEL_VER=$(grep -m1 "SUBLEVEL" Makefile | awk '{print $3}')
-          echo "kernel_ver=$KERNEL_VER" >> $GITHUB_OUTPUT
+          VERSION=$(grep -m1 "VERSION =" Makefile | awk '{print $3}')
+          PATCHLEVEL=$(grep -m1 "PATCHLEVEL =" Makefile | awk '{print $3}')
+          SUBLEVEL=$(grep -m1 "SUBLEVEL =" Makefile | awk '{print $3}')
+          FULL_VER="${VERSION}.${PATCHLEVEL}.${SUBLEVEL}"
+          echo "kernel_ver=$FULL_VER" >> $GITHUB_OUTPUT
 
       - name: Add KernelSU
         run: |
@@ -56,7 +61,7 @@ jobs:
             cd ..
             patch -p1 < ksu/kernel.patch || true
           else
-            echo "⚠️ No matching KernelSU patch found for kernel version ${{ steps.kernelver.outputs.kernel_ver }}, skipping..."
+            echo "⚠️ No matching KernelSU patch found for version ${{ steps.kernelver.outputs.kernel_ver }}, skipping..."
           fi
 
       - name: Build Kernel
@@ -70,16 +75,29 @@ jobs:
           export LD=ld.lld
 
           make O=out ARCH=arm64 vendor/raphael_defconfig
-          make -j$(nproc) O=out ARCH=arm64
+          make -j$(nproc) O=out ARCH=arm64 \
+            CC=clang \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            --gcc-toolchain=$HOME/toolchains/gcc64
 
-      - name: Pack into ZIP
+      - name: Clone AnyKernel3
         run: |
-          cd $GITHUB_WORKSPACE/out/arch/arm64/boot
-          zip -r9 $GITHUB_WORKSPACE/raphael-kernel.zip Image.gz-dtb
+          git clone https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
+          # copy dtbo if exists
+          if [ -f out/arch/arm64/boot/dtbo.img ]; then
+            cp out/arch/arm64/boot/dtbo.img AnyKernel3/
+          fi
+
+      - name: Pack into Flashable ZIP
+        run: |
+          cd AnyKernel3
+          zip -r9 $GITHUB_WORKSPACE/raphael-kernel-flashable.zip *
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v3
         with:
-          name: raphael-kernel
-          path: raphael-kernel.zip
-
+          name: raphael-kernel-flashable
+          path: raphael-kernel-flashable.zip
+```
