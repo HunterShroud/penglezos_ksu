@@ -34,7 +34,10 @@ jobs:
         id: kver
         run: |
           cd $GITHUB_WORKSPACE
-          KERNEL_VER=$(grep -m1 "SUBLEVEL" Makefile | awk '{print $3}')
+          VER=$(grep -m1 "^VERSION =" Makefile | awk '{print $3}')
+          PATCH=$(grep -m1 "^PATCHLEVEL =" Makefile | awk '{print $3}')
+          SUB=$(grep -m1 "^SUBLEVEL =" Makefile | awk '{print $3}')
+          KERNEL_VER="$VER.$PATCH.$SUB"
           echo "kernel_ver=$KERNEL_VER" >> $GITHUB_OUTPUT
 
       - name: Add KernelSU
@@ -90,7 +93,7 @@ jobs:
           zip -r9 kernel-build.zip *
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: kernel-build
           path: output/kernel-build.zip
