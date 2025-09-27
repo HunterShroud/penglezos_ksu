@@ -4,7 +4,7 @@ on:
   workflow_dispatch:   # manual trigger
   push:                # auto trigger on push
     branches:
-      - "14-DSPocd"    # adjust branch name if needed
+      - "**"           # run on all branches
 
 jobs:
   build:
