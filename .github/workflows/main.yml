@@ -21,22 +21,35 @@ jobs:
               gcc clang llvm lld git zip unzip wget curl build-essential \
               python3 python3-pip ccache
 
-      - name: Setup Toolchain
+      - name: Setup Toolchain (with Clang fallback)
         run: |
           mkdir -p ~/toolchains
           cd ~/toolchains
-          # GCC 4.9 (still available)
+          # GCC 4.9
           git clone https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 --depth=1 gcc64
-          # LLVM/Clang 14.0.6 (download from GitHub)
-          wget https://github.com/llvm/llvm-project/releases/download/llvmorg-14.0.6/clang+llvm-14.0.6-x86_64-linux-gnu-ubuntu-20.04.tar.xz
-          tar -xf clang+llvm-14.0.6-x86_64-linux-gnu-ubuntu-20.04.tar.xz
-          mv clang+llvm-14.0.6-x86_64-linux-gnu-ubuntu-20.04 clang
+
+          # Try Clang 14
+          CLANG_URL_14="https://github.com/llvm/llvm-project/releases/download/llvmorg-14.0.6/clang+llvm-14.0.6-x86_64-linux-gnu-ubuntu-20.04.tar.xz"
+          CLANG_URL_13="https://github.com/llvm/llvm-project/releases/download/llvmorg-13.0.1/clang+llvm-13.0.1-x86_64-linux-gnu-ubuntu-20.04.tar.xz"
+
+          echo ">>> Downloading Clang 14..."
+          if wget -q --spider $CLANG_URL_14; then
+            wget $CLANG_URL_14 -O clang.tar.xz
+          else
+            echo "⚠️ Clang 14 not found, falling back to Clang 13"
+            wget $CLANG_URL_13 -O clang.tar.xz
+          fi
+
+          tar -xf clang.tar.xz
+          mv clang+llvm-* clang
 
       - name: Detect Kernel Version
         id: kver
         run: |
           cd $GITHUB_WORKSPACE
-          KERNEL_VER=$(make kernelversion)
+          KERNEL_MAJOR=$(grep -m1 "^VERSION =" Makefile | awk '{print $3}')
+          KERNEL_MINOR=$(grep -m1 "^PATCHLEVEL =" Makefile | awk '{print $3}')
+          KERNEL_VER="${KERNEL_MAJOR}.${KERNEL_MINOR}"
           echo "kernel_ver=$KERNEL_VER" >> $GITHUB_OUTPUT
 
       - name: Add KernelSU
@@ -45,10 +58,20 @@ jobs:
           git clone https://github.com/tiann/KernelSU ksu
           cd ksu
           git submodule update --init --recursive
-          if [ -d "next/patches/${{ steps.kver.outputs.kernel_ver }}" ]; then
-            git am next/patches/${{ steps.kver.outputs.kernel_ver }}/*
+
+          cd $GITHUB_WORKSPACE
+          KERNEL_VER="${{ steps.kver.outputs.kernel_ver }}"
+          echo ">>> Detected kernel version: $KERNEL_VER"
+
+          if [ -d "ksu/next/patches/$KERNEL_VER" ]; then
+            echo ">>> Applying KernelSU patches for $KERNEL_VER"
+            cd ksu
+            git am next/patches/$KERNEL_VER/* || { echo "❌ Patch failed"; exit 1; }
           else
-            echo "⚠️ No matching KernelSU patch found for kernel version ${{ steps.kver.outputs.kernel_ver }}"
+            echo "⚠️ No KernelSU patch found for $KERNEL_VER"
+            # Choose one behavior:
+            # exit 1   # Stop build if KernelSU not supported
+            echo ">>> Continuing without KernelSU" # Continue without KernelSU
           fi
 
       - name: Build Kernel
@@ -61,7 +84,7 @@ jobs:
 
           cd $GITHUB_WORKSPACE
 
-          # Generate default config (update this to your device defconfig)
+          # Generate default config (change to your defconfig!)
           make raphael_defconfig
 
           # Enable modules + disable signature enforcement
