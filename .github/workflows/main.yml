@@ -1,0 +1,82 @@
+name: Build Kernel with KernelSU
+
+on:
+  workflow_dispatch:   # manual trigger
+  push:                # auto trigger on push
+    branches:
+      - "14-DSPocd"    # adjust branch name if needed
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+
+      - name: Setup Build Environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev make \
+              gcc clang llvm lld git zip unzip wget curl build-essential \
+              python3 python3-pip ccache
+
+      - name: Setup Toolchain
+        run: |
+          mkdir ~/toolchains
+          cd ~/toolchains
+          git clone https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 --depth=1 gcc64
+          git clone https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/clang-r353983c --depth=1 clang
+
+      - name: Add KernelSU
+        run: |
+          cd $GITHUB_WORKSPACE
+          git clone https://github.com/tiann/KernelSU.git KernelSU --depth=1
+          # Apply KernelSU patch for Android 4.14 kernel
+          git am KernelSU/patches/android-4.14/*.patch || true
+
+      - name: Build Kernel
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export PATH=$HOME/toolchains/gcc64/bin:$HOME/toolchains/clang/bin:$PATH
+          export CROSS_COMPILE=aarch64-linux-android-
+          export CC=clang
+
+          cd $GITHUB_WORKSPACE
+
+          # Generate default config
+          make raphael_defconfig
+
+          # Enable modules + disable signature + enable KSU
+          ./scripts/config --set-val CONFIG_MODULES y
+          ./scripts/config --set-val CONFIG_MODULE_UNLOAD y
+          ./scripts/config --set-val CONFIG_MODVERSIONS y
+          ./scripts/config --disable CONFIG_MODULE_SIG
+          ./scripts/config --disable CONFIG_MODULE_SIG_ALL
+          ./scripts/config --set-str CONFIG_MODULE_SIG_KEY ""
+          ./scripts/config --disable CONFIG_IMA
+          ./scripts/config --disable CONFIG_IMA_APPRAISE
+          ./scripts/config --disable CONFIG_LOCK_DOWN_LSM || true
+          ./scripts/config --enable CONFIG_KSU   # enable KernelSU
+
+          make olddefconfig
+
+          # Build kernel and modules
+          make -j$(nproc)
+          make -j$(nproc) modules
+
+      - name: Pack into ZIP
+        run: |
+          cd $GITHUB_WORKSPACE
+          mkdir -p output
+          cp arch/arm64/boot/Image.gz-dtb output/ || true
+          make INSTALL_MOD_PATH=output modules_install || true
+          cd output
+          zip -r9 kernel-build.zip *
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-build
+          path: output/kernel-build.zip
