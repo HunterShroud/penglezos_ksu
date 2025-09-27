@@ -1,103 +1,126 @@
-```yaml
-name: Build Kernel with KernelSU + AnyKernel3
+name: Build Kernel (KernelSU + AnyKernel3)
 
 on:
   push:
     branches:
-      - "*"
+      - "**"
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Kernel Source
-        uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: true
 
-      - name: Setup Build Environment
+      - name: Setup build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y git wget curl build-essential bc bison flex \
-              libncurses5-dev libssl-dev ccache unzip zip python3
+            libncurses5-dev libssl-dev ccache unzip zip python3 lld clang || true
+          # ensure clang/lld exist (ubuntu runners usually already have clang)
 
-      - name: Setup Toolchains (Clang + GCC)
+      - name: Setup AOSP GCC toolchains
         run: |
-          mkdir -p ~/toolchains
-          cd ~/toolchains
+          mkdir -p "$HOME/toolchains"
+          cd "$HOME/toolchains"
+          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 gcc64 || true
+          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9 gcc32 || true
+          ls -la
 
-          echo ">>> Downloading Clang 14"
-          if ! wget -q https://github.com/llvm/llvm-project/releases/download/llvmorg-14.0.6/clang+llvm-14.0.6-x86_64-linux-gnu-ubuntu-20.04.tar.xz; then
-            echo "⚠️ Clang 14 not found, falling back to Clang 13"
-            wget -q https://github.com/llvm/llvm-project/releases/download/llvmorg-13.0.1/clang+llvm-13.0.1-x86_64-linux-gnu-ubuntu-20.04.tar.xz
-            tar -xf clang+llvm-13.0.1-x86_64-linux-gnu-ubuntu-20.04.tar.xz
-            mv clang+llvm-13.0.1-x86_64-linux-gnu-ubuntu-20.04 clang
-          else
-            tar -xf clang+llvm-14.0.6-x86_64-linux-gnu-ubuntu-20.04.tar.xz
-            mv clang+llvm-14.0.6-x86_64-linux-gnu-ubuntu-20.04 clang
-          fi
-
-          echo ">>> Downloading AOSP GCC 4.9 toolchains"
-          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 gcc64
-          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9 gcc32
-
-      - name: Detect Kernel Version
+      - name: Detect kernel version
         id: kernelver
         run: |
-          cd $GITHUB_WORKSPACE
-          VERSION=$(grep -m1 "VERSION =" Makefile | awk '{print $3}')
-          PATCHLEVEL=$(grep -m1 "PATCHLEVEL =" Makefile | awk '{print $3}')
-          SUBLEVEL=$(grep -m1 "SUBLEVEL =" Makefile | awk '{print $3}')
-          FULL_VER="${VERSION}.${PATCHLEVEL}.${SUBLEVEL}"
-          echo "kernel_ver=$FULL_VER" >> $GITHUB_OUTPUT
+          cd "$GITHUB_WORKSPACE"
+          VERSION=$(grep -m1 "^VERSION =" Makefile | awk '{print $3}')
+          PATCHLEVEL=$(grep -m1 "^PATCHLEVEL =" Makefile | awk '{print $3}')
+          SUBLEVEL=$(grep -m1 "^SUBLEVEL =" Makefile | awk '{print $3}')
+          FULL="${VERSION}.${PATCHLEVEL}.${SUBLEVEL}"
+          MAJOR_MINOR="${VERSION}.${PATCHLEVEL}"
+          echo "full=${FULL}" >> "$GITHUB_OUTPUT"
+          echo "major_minor=${MAJOR_MINOR}" >> "$GITHUB_OUTPUT"
+          echo "Detected kernel full: ${FULL}, major.minor: ${MAJOR_MINOR}"
 
-      - name: Add KernelSU
+      - name: Add / try KernelSU patches
         run: |
-          cd $GITHUB_WORKSPACE
-          git clone https://github.com/tiann/KernelSU ksu
-          cd ksu
-          if git checkout "v${{ steps.kernelver.outputs.kernel_ver }}" 2>/dev/null; then
-            echo "✅ Applied KernelSU for version ${{ steps.kernelver.outputs.kernel_ver }}"
-            cd ..
-            patch -p1 < ksu/kernel.patch || true
-          else
-            echo "⚠️ No matching KernelSU patch found for version ${{ steps.kernelver.outputs.kernel_ver }}, skipping..."
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          # clone KernelSU (shallow)
+          git clone --depth=1 https://github.com/tiann/KernelSU ksu || true
+          cd ksu || { echo "ksu clone failed or not present"; exit 0; }
+          git submodule update --init --recursive || true
+
+          KVER_FULL="${{ steps.kernelver.outputs.full }}"
+          KVER_MM="${{ steps.kernelver.outputs.major_minor }}"
+
+          echo "Looking for KernelSU patch for: $KVER_FULL / $KVER_MM"
+
+          PATCH_APPLIED=0
+          for DIR in "next/patches/${KVER_FULL}" "next/patches/${KVER_MM}" "patches/${KVER_FULL}" "patches/${KVER_MM}"; do
+            if [ -d "$DIR" ]; then
+              echo "Applying KernelSU patches from: $DIR"
+              git am "$DIR"/*.patch || { echo "Patch apply failed"; exit 1; }
+              PATCH_APPLIED=1
+              break
+            fi
+          done
+
+          if [ "$PATCH_APPLIED" -eq 0 ]; then
+            echo "⚠️ No matching KernelSU patch found. Continuing without applying KernelSU patches."
+            # If you want to abort when no patch found, uncomment:
+            # echo "No KernelSU patch found - failing build as requested"; exit 1
           fi
 
-      - name: Build Kernel
+      - name: Build kernel (Clang + AOSP GCC)
+        env:
+          TOOLCHAIN_GCC64: ${{ runner.home }}/toolchains/gcc64
+          TOOLCHAIN_GCC32: ${{ runner.home }}/toolchains/gcc32
         run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+
           export ARCH=arm64
           export SUBARCH=arm64
-          export CROSS_COMPILE=$HOME/toolchains/gcc64/bin/aarch64-linux-android-
-          export CROSS_COMPILE_ARM32=$HOME/toolchains/gcc32/bin/arm-linux-androideabi-
-          export PATH=$HOME/toolchains/clang/bin:$HOME/toolchains/gcc64/bin:$HOME/toolchains/gcc32/bin:$PATH
+          export CROSS_COMPILE=$TOOLCHAIN_GCC64/bin/aarch64-linux-android-
+          export CROSS_COMPILE_ARM32=$TOOLCHAIN_GCC32/bin/arm-linux-androideabi-
+          export PATH="$TOOLCHAIN_GCC64/bin:$TOOLCHAIN_GCC32/bin:$PATH"
           export CC=clang
           export LD=ld.lld
 
-          make O=out ARCH=arm64 vendor/raphael_defconfig
+          # generate defconfig (adjust name if your defconfig is different)
+          make O=out ARCH=arm64 raphael_defconfig
+
+          # ensure module support + disable module signature / IMA if present
+          ./scripts/config --file out/.config --set-val CONFIG_MODULES y || true
+          ./scripts/config --file out/.config --set-val CONFIG_MODULE_UNLOAD y || true
+          ./scripts/config --file out/.config --set-val CONFIG_MODVERSIONS y || true
+          ./scripts/config --file out/.config --disable CONFIG_MODULE_SIG || true
+          ./scripts/config --file out/.config --disable CONFIG_MODULE_SIG_ALL || true
+          ./scripts/config --file out/.config --set-str CONFIG_MODULE_SIG_KEY "" || true
+          ./scripts/config --file out/.config --disable CONFIG_IMA || true
+          ./scripts/config --file out/.config --disable CONFIG_IMA_APPRAISE || true
+          ./scripts/config --file out/.config --disable CONFIG_LOCK_DOWN_LSM || true
+
+          make -s O=out olddefconfig
+
+          # build (pass gcc-toolchain so clang can find GCC libs/rt)
           make -j$(nproc) O=out ARCH=arm64 \
             CC=clang \
             CROSS_COMPILE=aarch64-linux-android- \
             CROSS_COMPILE_ARM32=arm-linux-androideabi- \
-            --gcc-toolchain=$HOME/toolchains/gcc64
+            --gcc-toolchain="$TOOLCHAIN_GCC64"
 
-      - name: Clone AnyKernel3
+          # install modules to a temp folder (optional)
+          make -s O=out INSTALL_MOD_PATH=output modules_install || true
+
+      - name: Prepare AnyKernel3 and package flashable ZIP
         run: |
-          git clone https://github.com/osm0sis/AnyKernel3.git AnyKernel3
-          cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
-          # copy dtbo if exists
-          if [ -f out/arch/arm64/boot/dtbo.img ]; then
-            cp out/arch/arm64/boot/dtbo.img AnyKernel3/
-          fi
-
-      - name: Pack into Flashable ZIP
-        run: |
-          cd AnyKernel3
-          zip -r9 $GITHUB_WORKSPACE/raphael-kernel-flashable.zip *
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: raphael-kernel-flashable
-          path: raphael-kernel-flashable.zip
-```
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          rm -rf AnyKernel3 || true
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          # copy kernel image(s)
+          if [ -f out/arch/arm64/boot/Image.gz-dtb ]; th
